@@ -1213,6 +1213,21 @@ class ConfigForm extends Form
         $addEvent = new Event('form.add_elements', $this);
         $this->getEventManager()->triggerEvent($addEvent);
 
+        // Use Laminas's input filter for URL validation on certain optional fields
+        $inputFilter = $this->getInputFilter();
+        foreach ([
+            'iiifserver_media_api_url',
+            'iiifserver_manifest_rights_url',
+            'iiifserver_manifest_placeholder_canvas_default',
+            'iiifserver_manifest_logo_default',
+        ] as $name) {
+            $inputFilter->add([
+                'name' => $name,
+                'required' => false,
+                'allow_empty' => true, // Allow empty strings to pass Laminas Uri validation
+            ]);
+        }
+
         $filterEvent = new Event('form.add_input_filters', $this, ['inputFilter' => $this->getInputFilter()]);
         $this->getEventManager()->triggerEvent($filterEvent);
     }
