@@ -1213,8 +1213,12 @@ class ConfigForm extends Form
         $addEvent = new Event('form.add_elements', $this);
         $this->getEventManager()->triggerEvent($addEvent);
 
-        // Use Laminas's input filter for URL validation on certain optional fields
+        // Fix optional fields whose element types default to required=true :
+        // - Field type 'Element\Url' uses a Uri validator that rejects empty strings.
+        // - Field type 'OmekaElement\PropertySelect' inherits required=true from Laminas Select.
+        // Both must be overridden so leaving a field empty does not abort saving the config form.
         $inputFilter = $this->getInputFilter();
+        // Field type 'Element\Url'
         foreach ([
             'iiifserver_media_api_url',
             'iiifserver_manifest_rights_url',
@@ -1224,8 +1228,18 @@ class ConfigForm extends Form
             $inputFilter->add([
                 'name' => $name,
                 'required' => false,
-                'allow_empty' => true, // Allow empty strings to pass Laminas Uri validation
+                'allow_empty' => true,
             ]);
+        }
+        // Field type 'OmekaElement\PropertySelect'
+        foreach ($this as $element) {
+            if ($element instanceof \Omeka\Form\Element\AbstractVocabularyMemberSelect) {
+                $inputFilter->add([
+                    'name' => $element->getName(),
+                    'required' => false,
+                    'allow_empty' => true,
+                ]);
+            }
         }
 
         $filterEvent = new Event('form.add_input_filters', $this, ['inputFilter' => $this->getInputFilter()]);
