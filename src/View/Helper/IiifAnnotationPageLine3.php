@@ -52,8 +52,12 @@ class IiifAnnotationPageLine3 extends AbstractHelper
         $opts['callingResource'] = $resource;
         $opts['callingMotivation'] = 'annotation';
         $opts['isDereferenced'] = true;
-        // TODO Use TraitMediaInfo. Or filter medias first.
-        foreach ($resource->item()->media() as $media) {
+        // Filter the medias first and find the related OCR media for this page
+        // Then use that one as $mediasToSearch and create an AnnotationPage for it
+        // Fallback: if relatedOcr cannot be found, loop over all media for this item.
+        $relatedOcr = $this->view->iiifMediaRelatedOcr($resource, $index);
+        $mediasToSearch = $relatedOcr ? [$relatedOcr] : $resource->item()->media();
+        foreach ($mediasToSearch as $media) {
             $annotationPage = new AnnotationPage();
             $annotationPage
                 ->setOptions($opts)
