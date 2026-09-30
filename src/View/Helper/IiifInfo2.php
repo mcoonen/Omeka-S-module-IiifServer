@@ -91,6 +91,16 @@ class IiifInfo2 extends AbstractHelper
             $width = $imageSize['width'];
             $height = $imageSize['height'];
 
+            // No dimensions resolvable means the original file is no longer
+            // serviceable (missing on disk, broken external server, …). The
+            // IIIF Image API recommends 404/410 over a degraded info.json.
+            if (!$width || !$height) {
+                throw new \IiifServer\Iiif\Exception\NotFoundException(sprintf(
+                    'Image media #%d has no resolvable dimensions; the original file is likely missing.',
+                    $media->id()
+                ));
+            }
+
             // Check if Image Server is available.
             $tiles = [];
             if ($this->hasModuleImageServer) {
@@ -145,10 +155,13 @@ class IiifInfo2 extends AbstractHelper
             $info['sizes'] = $sizes;
             if ($tiles) {
                 $info['tiles'] = $tiles;
-            } else {
+            } elseif ($width && $height) {
                 // When no pre-tiled data, provide default tiles info so viewers
                 // like Diva/OSD can compute tile requests. The server is
-                // level2, so arbitrary region requests are supported.
+                // level2, so arbitrary region requests are supported. Skip the
+                // block when dimensions are unknown (mediaDimension could not
+                // resolve them): exposing a tile descriptor without
+                // width/height confuses the viewer.
                 $info['tiles'] = [[
                     'width' => 512,
                     'scaleFactors' => $this->defaultScaleFactors($width, $height, 512),
@@ -272,8 +285,17 @@ class IiifInfo2 extends AbstractHelper
                 // no break.
             case 'property':
                 if ($resource) {
-                    $property = $setting($this->hasModuleImageServer ? 'imageserver_info_rights_property' : 'iiifserver_manifest_rights_property');
-                    $url = (string) $resource->value($property);
+                    $properties = $setting($this->hasModuleImageServer ? 'imageserver_info_rights_property' : 'iiifserver_manifest_rights_property');
+                    $url = '';
+                    foreach ((array) $properties as $property) {
+                        if (!$property) {
+                            continue;
+                        }
+                        $url = (string) $resource->value($property);
+                        if ($url !== '') {
+                            break;
+                        }
+                    }
                 }
                 break;
             case 'none':

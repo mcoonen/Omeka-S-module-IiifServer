@@ -88,9 +88,6 @@ return [
             'iiifAnnotationList' => View\Helper\IiifAnnotationList::class,
             'iiifAnnotationList2' => View\Helper\IiifAnnotationList2::class,
             'iiifAnnotationList3' => View\Helper\IiifAnnotationList3::class,
-            'iiifAnnotationPageLine' => View\Helper\IiifAnnotationPageLine::class,
-            'iiifAnnotationPageLine2' => View\Helper\IiifAnnotationPageLine2::class,
-            'iiifAnnotationPageLine3' => View\Helper\IiifAnnotationPageLine3::class,
             'iiifCollection' => View\Helper\IiifCollection::class,
             'iiifCollection2' => View\Helper\IiifCollection2::class,
             'iiifCollection3' => View\Helper\IiifCollection3::class,
@@ -105,6 +102,7 @@ return [
             'iiifManifestExternal' => View\Helper\IiifManifestExternal::class,
             'iiifManifestLink' => View\Helper\IiifManifestLink::class,
             'iiifTypeOfMedia' => View\Helper\IiifTypeOfMedia::class,
+            'iiifHasDisplayableMedia' => View\Helper\IiifHasDisplayableMedia::class,
             'iiifPlayer' => View\Helper\IiifPlayer::class,
         ],
         'factories' => [
@@ -114,7 +112,6 @@ return [
             'iiifMediaUrl' => Service\ViewHelper\IiifMediaUrlFactory::class,
             'iiifManifest2' => Service\ViewHelper\IiifManifest2Factory::class,
             'iiifManifest3' => Service\ViewHelper\IiifManifest3Factory::class,
-            'iiifMediaRelatedOcr' => Service\ViewHelper\IiifMediaRelatedOcrFactory::class,
             'iiifTileInfo' => Service\ViewHelper\IiifTileInfoFactory::class,
             'iiifUrl' => Service\ViewHelper\IiifUrlFactory::class,
             'isIiifMedia' => Service\ViewHelper\IsIiifMediaFactory::class,
@@ -164,7 +161,6 @@ return [
             'rangeToArray' => Mvc\Controller\Plugin\RangeToArray::class,
         ],
         'factories' => [
-            'fixUtf8' => Service\ControllerPlugin\FixUtf8Factory::class,
             'isIiifMedia' => Service\ControllerPlugin\IsIiifMediaFactory::class,
             'mediaDimension' => Service\ControllerPlugin\MediaDimensionFactory::class,
         ],
@@ -552,7 +548,7 @@ return [
             'iiifserver_manifest_attribution_property' => '',
             'iiifserver_manifest_attribution_default' => '',
             'iiifserver_manifest_rights' => 'property_or_url',
-            'iiifserver_manifest_rights_property' => 'dcterms:license',
+            'iiifserver_manifest_rights_property' => ['dcterms:license', 'dcterms:rights'],
             'iiifserver_manifest_rights_uri' => 'https://rightsstatements.org/vocab/CNE/1.0/',
             'iiifserver_manifest_rights_url' => '',
             'iiifserver_manifest_rights_text' => '',
@@ -568,6 +564,7 @@ return [
             'iiifserver_manifest_seealso_property' => '',
             'iiifserver_manifest_rendering_skip' => false,
             'iiifserver_manifest_rendering_media_types' => [],
+            'iiifserver_manifest_rendering_zip' => false,
             'iiifserver_manifest_start_property' => '',
             'iiifserver_manifest_start_primary_media' => false,
             'iiifserver_manifest_viewing_direction_property' => '',
@@ -577,9 +574,10 @@ return [
             'iiifserver_manifest_placeholder_canvas_default' => '',
             'iiifserver_manifest_behavior_property' => '',
             'iiifserver_manifest_behavior_default' => ['none'],
-            'iiifserver_manifest_canvas_label' => 'template',
+            'iiifserver_manifest_canvas_label' => 'position',
             'iiifserver_manifest_canvas_label_property' => '',
             'iiifserver_manifest_logo_default' => '',
+            'iiifserver_manifest_logo_default_asset' => null,
             'iiifserver_manifest_html_descriptive' => true,
             'iiifserver_manifest_properties_collection_whitelist' => [],
             'iiifserver_manifest_properties_item_whitelist' => [],
@@ -602,8 +600,6 @@ return [
             'iiifserver_manifest_structures_property' => '',
             'iiifserver_manifest_structures_skip_flat' => false,
             // Various.
-            'iiifserver_xml_image_match' => 'order',
-            'iiifserver_xml_fix_mode' => 'no',
             'iiifserver_access_resource_skip' => false,
             'iiifserver_access_ocr_skip' => false,
             // Urls.
@@ -622,10 +618,9 @@ return [
             // This option is used by module Bulk Import and for a future improvement.
             'iiifserver_media_api_url' => '',
             'iiifserver_media_api_default_version' => '2',
-            'iiifserver_media_api_supported_versions' => [
-                '2/2',
-                '3/2',
-            ],
+            'iiifserver_media_api_supported_version_1' => '',
+            'iiifserver_media_api_supported_version_2' => '2',
+            'iiifserver_media_api_supported_version_3' => '2',
             // The version and the prefix should be set in module config routing for now.
             'iiifserver_media_api_version_append' => false,
             'iiifserver_media_api_prefix' => '',
@@ -640,11 +635,18 @@ return [
             ],
         ],
         'site_settings' => [
+            'iiifserver_manifest_link_dialog' => [
+                'button_label',
+                'copy_on_click',
+                'drag_icon',
+                'what_is_iiif',
+            ],
             'iiifserver_player' => 'openseadragon',
             'iiifserver_player_osd_sidebar' => 'bottom',
             'iiifserver_player_inline_height' => '600px',
             'iiifserver_player_button_label' => 'Open IIIF viewer', // @translate
             'iiifserver_player_button_lazy' => false,
+            'iiifserver_player_osd_show_zoom' => false,
         ],
         // Registry of ingesters producing iiif media, grouped by type.
         // Modules (IIIF Remote Image, IIIF Remote Video, etc.) may contribute

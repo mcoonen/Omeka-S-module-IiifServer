@@ -161,6 +161,14 @@ trait IiifServerControllerTrait
         $iiifInfo = $this->viewHelpers()->get('iiifInfo');
         try {
             $info = $iiifInfo($resource, $this->requestedApiVersion);
+        } catch (\IiifServer\Iiif\Exception\NotFoundException $e) {
+            // The underlying file is no longer serviceable (missing on disk,
+            // broken external server, …). The IIIF Image API spec recommends
+            // 404/410 over a degraded info.json.
+            return $this->jsonError(
+                new PsrMessage($e->getMessage()),
+                \Laminas\Http\Response::STATUS_CODE_404
+            );
         } catch (\IiifServer\Iiif\Exception\RuntimeException $e) {
             return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_400);
         }
@@ -230,14 +238,27 @@ trait IiifServerControllerTrait
                 try {
                     return $this->api()->read('media', $id)->getContent();
                 } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                }
+                try {
+                    return $this->api()->read('digital_objects', $id)->getContent();
+                } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                    return null;
+                } catch (\Omeka\Api\Exception\BadRequestException $e) {
                     return null;
                 }
+                // no break.
             case 'storage_id':
                 // The storage id may contain slashs (module ArchiveRepertory).
                 $id = strtr($id, ['%2F' => '/', '%2f' => '/']);
                 try {
                     return $this->api()->read('media', ['storageId' => $id])->getContent();
                 } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                }
+                try {
+                    return $this->api()->read('digital_objects', ['storage_id' => $id])->getContent();
+                } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                    return null;
+                } catch (\Omeka\Api\Exception\BadRequestException $e) {
                     return null;
                 }
             case 'filename':
@@ -256,6 +277,12 @@ trait IiifServerControllerTrait
                     // Anyway, storage_id is unique.
                     return $this->api()->read('media', ['storageId' => $storageId])->getContent();
                 } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                }
+                try {
+                    return $this->api()->read('digital_objects', ['storage_id' => $storageId])->getContent();
+                } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                    return null;
+                } catch (\Omeka\Api\Exception\BadRequestException $e) {
                     return null;
                 }
         }

@@ -45,6 +45,7 @@ use Omeka\Settings\Settings;
  */
 class IiifManifest2 extends AbstractHelper
 {
+    use TraitDefaultLogoUrl;
     use TraitDescriptiveRights;
     use TraitStructuralStructures;
 
@@ -253,7 +254,7 @@ class IiifManifest2 extends AbstractHelper
             $manifest['license'] = $license;
         }
 
-        $logo = $this->setting->__invoke('iiifserver_manifest_logo_default');
+        $logo = $this->defaultLogoUrl();
         if ($logo) {
             $manifest['logo'] = ['@id' => $logo];
         }
@@ -1527,7 +1528,7 @@ class IiifManifest2 extends AbstractHelper
             $types['thumbnails'] = \Doctrine\DBAL\Connection::PARAM_STR_ARRAY;
         }
 
-        $id = $conn->executeQuery($qb, $bind, $types)->fetchOne();
+        $id = $conn->executeQuery($qb->getSQL(), $bind, $types)->fetchOne();
         if ($id) {
             // TODO Check privacy of media for user. Use read if possible.
             // Media may be private for the user, so use searchOne, not read.
@@ -1811,12 +1812,17 @@ class IiifManifest2 extends AbstractHelper
      */
     protected function seeAlso(MediaRepresentation $media, $indexOne): ?array
     {
-        $relatedMedia = $this->view->iiifMediaRelatedOcr($media, (int) $indexOne ?: null);
-        if (!$relatedMedia) {
+        $plugins = $this->view->getHelperPluginManager();
+        if (!$plugins->has('iiifSearchAnnotationUrl')) {
+            return null;
+        }
+        $iiifSearchUrl = $plugins->get('iiifSearchAnnotationUrl');
+        $altoUrl = $iiifSearchUrl->altoUrl($media->item(), (int) $indexOne);
+        if (!$altoUrl) {
             return null;
         }
         return [
-            '@id' => $relatedMedia->originalUrl(),
+            '@id' => $altoUrl,
             'profile' => 'http://www.loc.gov/standards/alto/v4/alto.xsd',
             'format' => 'application/alto+xml',
             'label' => 'ALTO XML',
@@ -1824,26 +1830,24 @@ class IiifManifest2 extends AbstractHelper
     }
 
     /**
-     * @todo Factorize.
-     *
      * Note: multiple other content may be returned, so it's an array of arrays,
      * even if there is only one currently.
      */
     protected function otherContents(MediaRepresentation $media, $indexOne): ?array
     {
-        $relatedMedia = $this->view->iiifMediaRelatedOcr($media, (int) $indexOne ?: null);
-        if (!$relatedMedia) {
+        $plugins = $this->view->getHelperPluginManager();
+        if (!$plugins->has('iiifSearchAnnotationUrl')) {
             return null;
         }
-        $id = $this->view->iiifUrl($relatedMedia->item(), 'iiifserver/uri', '2', [
-            'type' => 'annotation-page',
-            'name' => $media->id(),
-            'subtype' => 'line',
-        ]);
+        $iiifSearchUrl = $plugins->get('iiifSearchAnnotationUrl');
+        $listUrl = $iiifSearchUrl->__invoke($media->item(), (int) $indexOne, 2);
+        if (!$listUrl) {
+            return null;
+        }
         return [[
-            '@id' => $id,
+            '@id' => $listUrl,
             '@type' => 'sc:AnnotationList',
-            'label' => $this->view->translate('Text of current page'), // @ŧranslate
+            'label' => $this->view->translate('Text of current page'), // @translate
         ]];
     }
 

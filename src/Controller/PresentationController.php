@@ -120,12 +120,53 @@ class PresentationController extends AbstractActionController
             // TODO Manage level reserved.
         }
 
-        // Manifests can be cached by browsers and proxies (1h/24h).
-        $this->getResponse()->getHeaders()
-            ->addHeaderLine('Cache-Control', 'public, max-age=3600, s-maxage=86400');
-
         // Version may be 2 or 3.
         $version = $this->requestedVersion();
+
+        // Resolve a version-less request ("/iiif/{id}/manifest") to the default
+        // version, so the cache uses the same versioned path as an explicit
+        // request. Otherwise the cache path "iiif/{version}/{id}.manifest.json"
+        // with an empty version collapses to "iiif/{id}.manifest.json", an
+        // orphan that the regeneration job (which writes iiif/2/ and iiif/3/)
+        // never updates, so it stays stale forever.
+        if ($version === '' || $version === null) {
+            $version = (string) $this->settings()->get('iiifserver_manifest_default_version', '3');
+        }
+
+        // Compute conditional-cache validators (ETag + Last-Modified) from the
+        // item modified date and the max modified date of its media. Skip 304
+        // entirely for privileged users (their manifests may differ from the
+        // public version).
+        $canCache304 = !$this->userIsAllowed('Omeka\Entity\Resource', 'view-all');
+        if ($canCache304 && $this->getPluginManager()->has('accessLevel')) {
+            $canCache304 = !$this->identity();
+        }
+        $mtime = $this->manifestMtime($resource);
+        $etag = '"manifest-' . ($version ?: 'auto') . '-' . $resource->id() . '-' . $mtime . '"';
+        if ($canCache304) {
+            $request = $this->getRequest();
+            $ifNoneMatch = $request->getHeader('If-None-Match');
+            $ifModifiedSince = $request->getHeader('If-Modified-Since');
+            $matchesEtag = $ifNoneMatch && trim($ifNoneMatch->getFieldValue()) === $etag;
+            $matchesDate = $ifModifiedSince
+                && ($since = strtotime($ifModifiedSince->getFieldValue()))
+                && $since >= $mtime;
+            if ($matchesEtag || $matchesDate) {
+                $response = $this->getResponse();
+                $response->setStatusCode(\Laminas\Http\Response::STATUS_CODE_304);
+                $response->getHeaders()
+                    ->addHeaderLine('ETag', $etag)
+                    ->addHeaderLine('Last-Modified', gmdate('D, d M Y H:i:s', $mtime) . ' GMT')
+                    ->addHeaderLine('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+                return $response;
+            }
+        }
+
+        // Manifests can be cached by browsers and proxies (1h/24h).
+        $this->getResponse()->getHeaders()
+            ->addHeaderLine('Cache-Control', $canCache304 ? 'public, max-age=3600, s-maxage=86400' : 'private, max-age=0, must-revalidate')
+            ->addHeaderLine('ETag', $etag)
+            ->addHeaderLine('Last-Modified', gmdate('D, d M Y H:i:s', $mtime) . ' GMT');
 
         $manifest = null;
         $toCache = false;
@@ -215,11 +256,11 @@ class PresentationController extends AbstractActionController
         $name = $this->params('name');
         if ($type === 'canvas' && $name) {
             return $this->canvasAction();
-        } elseif ($type === 'annotation-page' && $name && $this->params('subtype')) {
-            return $this->annotationPageLineAction();
         } elseif ($type === 'annotation-list' && $name) {
             return $this->annotationListAction();
         }
+        // The annotation-page (OCR) route used to live here; OCR is now served
+        // by the IiifSearch module.
         return $this->jsonError(new PsrMessage(
             'The type "{type}" is currently only managed as uri, not url', // @translate
             ['type' => $type]
@@ -292,45 +333,6 @@ class PresentationController extends AbstractActionController
         return $this->iiifJsonLd($canvas, $version);
     }
 
-    protected function annotationPageLineAction()
-    {
-        // Unlike canvas, the name is the main media id.
-
-        $name = $this->params('name');
-        if (!$name) {
-            return $this->jsonError(new OmekaException\NotFoundException, \Laminas\Http\Response::STATUS_CODE_404);
-        }
-
-        $api = $this->api();
-
-        // When the id is a clean url identifier, the id is already extracted.
-        $id = $this->params('id');
-        try {
-            $api->read('items', ['id' => $id])->getContent();
-        } catch (\Omeka\Api\Exception\NotFoundException $e) {
-            return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_404);
-        }
-
-        try {
-            $media = $api->read('media', ['item' => $id, 'id' => $name])->getContent();
-        } catch (\Omeka\Api\Exception\NotFoundException $e) {
-            return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_404);
-        }
-
-        $viewHelpers = $this->viewHelpers();
-        $iiifAnnotationPageLine = $viewHelpers->get('iiifAnnotationPageLine');
-
-        $version = $this->requestedVersion();
-
-        try {
-            $annotationPageLine = $iiifAnnotationPageLine($media, null, $version);
-        } catch (\IiifServer\Iiif\Exception\RuntimeException $e) {
-            return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_400);
-        }
-
-        return $this->iiifJsonLd($annotationPageLine, $version);
-    }
-
     /**
      * Get the annotations list from module Annotate/Cartography for a media.
      *
@@ -358,7 +360,13 @@ class PresentationController extends AbstractActionController
         try {
             $media = $api->read('media', ['item' => $id, 'id' => $name])->getContent();
         } catch (\Omeka\Api\Exception\NotFoundException $e) {
-            return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_404);
+            // Fallback: the canvas target may be a DigitalObject referenced by
+            // the item via property values (no item FK on DO).
+            try {
+                $media = $api->read('digital_objects', ['id' => $name])->getContent();
+            } catch (\Throwable $e2) {
+                return $this->jsonError($e, \Laminas\Http\Response::STATUS_CODE_404);
+            }
         }
 
         $viewHelpers = $this->viewHelpers();
@@ -462,5 +470,44 @@ class PresentationController extends AbstractActionController
             }
         }
         return $result;
+    }
+
+    /**
+     * Return the most recent modification timestamp among the resource and its
+     * media (for items). Used to derive ETag/Last-Modified validators for the
+     * manifest.
+     */
+    protected function manifestMtime($resource): int
+    {
+        $tsOf = function ($r) {
+            $m = method_exists($r, 'modified') ? $r->modified() : null;
+            if (!$m) {
+                $m = method_exists($r, 'created') ? $r->created() : null;
+            }
+            return $m instanceof \DateTimeInterface ? $m->getTimestamp() : 0;
+        };
+        $mtime = $tsOf($resource);
+        if (method_exists($resource, 'media')) {
+            foreach ($resource->media() as $media) {
+                $t = $tsOf($media);
+                if ($t > $mtime) {
+                    $mtime = $t;
+                }
+            }
+        } elseif (method_exists($resource, 'items')) {
+            // ItemSet: include the most recent of its items as a proxy. Bound
+            // the loop to keep this cheap on large collections.
+            $i = 0;
+            foreach ($resource->items() as $item) {
+                $t = $tsOf($item);
+                if ($t > $mtime) {
+                    $mtime = $t;
+                }
+                if (++$i > 200) {
+                    break;
+                }
+            }
+        }
+        return $mtime > 0 ? $mtime : time();
     }
 }

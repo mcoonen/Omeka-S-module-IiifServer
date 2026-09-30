@@ -30,10 +30,20 @@
 
 namespace IiifServer;
 
-if (!class_exists('Common\TraitModule', false)) {
-    require_once file_exists(dirname(__DIR__) . '/Common/src/TraitModule.php')
-        ? dirname(__DIR__) . '/Common/src/TraitModule.php'
-        : dirname(__DIR__) . '/Common/TraitModule.php';
+// Load the module dependencies when installed as a zip.
+// With composer, libraries are stored in omeka vendor/ and the module has none.
+if (file_exists(__DIR__ . '/vendor/autoload.php')) {
+    require_once __DIR__ . '/vendor/autoload.php';
+}
+
+if (!trait_exists(\Common\TraitModule::class, false)) {
+    if (file_exists(OMEKA_PATH . '/modules/Common/src/TraitModule.php')) {
+        require_once OMEKA_PATH . '/modules/Common/src/TraitModule.php';
+    } elseif (file_exists(OMEKA_PATH . '/composer-addons/modules/Common/src/TraitModule.php')) {
+        require_once OMEKA_PATH . '/composer-addons/modules/Common/src/TraitModule.php';
+    } elseif (file_exists(dirname(__DIR__) . '/Common/src/TraitModule.php')) {
+        require_once dirname(__DIR__) . '/Common/src/TraitModule.php';
+    }
 }
 
 use Common\Stdlib\PsrMessage;
@@ -53,13 +63,6 @@ class Module extends AbstractModule
     use TraitModule;
 
     const NAMESPACE = __NAMESPACE__;
-
-    public function init(ModuleManager $moduleManager): void
-    {
-        // The autoload doesn’t work with GetId3.
-        // @see \IiifServer\Service\ControllerPlugin\MediaDimensionFactory
-        require_once __DIR__ . '/vendor/autoload.php';
-    }
 
     public function onBootstrap(MvcEvent $event): void
     {
@@ -98,6 +101,10 @@ class Module extends AbstractModule
      * @see https://iiif.io/api/presentation/3.0/
      * @see https://iiif.io/api/presentation/2.1/
      * @see https://iiif.io/api/image/3.0/
+     *
+     * Adapted and copied id:
+     * @see \IiifServer\Module::reencodeIdentifierSlashes()
+     * @see \IiifSearch\Module::reencodeIdentifierSlashes()
      */
     public function reencodeIdentifierSlashes(MvcEvent $event): void
     {
@@ -126,10 +133,7 @@ class Module extends AbstractModule
             return;
         }
 
-        $iiifBase = $matches[1];
-        $routePrefix = $matches[2] ?? '';
         $remainder = $matches[3] ?? '';
-
         if ($remainder === '' || $remainder === '/') {
             return;
         }
@@ -147,7 +151,7 @@ class Module extends AbstractModule
         // Known iiif presentation types and keywords that appear after the
         // identifier in the URL path. Used as anchors to detect where the
         // identifier portion ends.
-        // @see IiifServer config: route "uri" type constraint.
+        // See IiifServer config route "uri" type constraint.
         static $iiifKeywords = [
             'manifest' => true,
             'info.json' => true,
@@ -196,12 +200,13 @@ class Module extends AbstractModule
         $encodedIdentifier = implode('%2F', $identifierParts);
 
         $suffixParts = array_slice($segments, $identifierCount);
-        $newRemainder = $suffixParts
-            ? $encodedIdentifier . '/' . implode('/', $suffixParts)
-            : $encodedIdentifier;
+        if ($suffixParts) {
+            $encodedIdentifier .= '/' . implode('/', $suffixParts);
+        }
 
-        $newPath = $iiifBase . $routePrefix . '/' . $newRemainder;
-
+        $iiifBase = $matches[1];
+        $routePrefix = $matches[2] ?? '';
+        $newPath = $iiifBase . $routePrefix . '/' . $encodedIdentifier;
         if ($newPath !== $path) {
             $request->getUri()->setPath($newPath);
         }
@@ -212,10 +217,10 @@ class Module extends AbstractModule
         $services = $this->getServiceLocator();
         $translator = $services->get('MvcTranslator');
 
-        if (!method_exists($this, 'checkModuleActiveVersion') || !$this->checkModuleActiveVersion('Common', '3.4.84')) {
+        if (!method_exists($this, 'checkModuleActiveVersion') || !$this->checkModuleActiveVersion('Common', '3.4.88')) {
             $message = new \Omeka\Stdlib\Message(
                 $translator->translate('The module %1$s should be upgraded to version %2$s or later.'), // @translate
-                'Common', '3.4.84'
+                'Common', '3.4.88'
             );
             throw new \Omeka\Module\Exception\ModuleCannotInstallException((string) $message);
         }
@@ -230,23 +235,6 @@ class Module extends AbstractModule
             ))->setTranslator($translator);
         }
 
-        $config = $services->get('Config');
-        $basePath = $config['file_store']['local']['base_path'] ?: (OMEKA_PATH . '/files');
-
-        if (!$this->checkDestinationDir($basePath . '/iiif/2')) {
-            $errors[] = (string) (new PsrMessage(
-                'The directory "{directory}" is not writeable.', // @translate
-                ['directory' => $basePath . '/iiif']
-            ))->setTranslator($translator);
-        }
-
-        if (!$this->checkDestinationDir($basePath . '/iiif/3')) {
-            $errors[] = (string) (new PsrMessage(
-                'The directory "{directory}" is not writeable.', // @translate
-                ['directory' => $basePath . '/iiif']
-            ))->setTranslator($translator);
-        }
-
         if ($errors) {
             throw new \Omeka\Module\Exception\ModuleCannotInstallException(implode("\n", $errors));
         }
@@ -255,6 +243,7 @@ class Module extends AbstractModule
     protected function postInstall(): void
     {
         $this->updateWhitelist();
+        $this->ensureIiifDirectories();
 
         /** @var \Omeka\Settings\Settings $settings */
         $settings = $this->getServiceLocator()->get('Omeka\Settings');
@@ -343,9 +332,16 @@ class Module extends AbstractModule
 
     public function getConfigForm(PhpRenderer $renderer)
     {
+        $this->appendConfigApplyAsset($renderer);
+
         $services = $this->getServiceLocator();
         $plugins = $services->get('ControllerPluginManager');
         $messenger = $plugins->get('messenger');
+
+        // Preserve pending flash messages (e.g. the "Apply" success message):
+        // they are restored below, after the diagnostics are collected into the
+        // audit tab via the messenger as a temporary buffer.
+        $pending = $messenger->get();
 
         // Clear previous, run diagnostics, collect for audit tab.
         $messenger->clear();
@@ -364,6 +360,13 @@ class Module extends AbstractModule
         foreach ($diagExtra as $type => $msgs) {
             foreach ($msgs as $msg) {
                 $diagnostics[$type][] = $msg;
+            }
+        }
+
+        // Restore pending flash messages so they still display.
+        foreach ($pending as $type => $msgs) {
+            foreach ($msgs as $msg) {
+                $messenger->add($type, $msg);
             }
         }
 
@@ -403,76 +406,42 @@ class Module extends AbstractModule
             return null;
         }
 
-        $form = $formManager->get(\IiifServer\Form\ConfigForm::class);
-        $form->init();
-        $form->setData($data);
+        if ($this->invalidConfigForm) {
+            // Reuse the failed-submit form so its per-field error messages
+            // remain attached and render inline via formRow().
+            $form = $this->invalidConfigForm;
+        } else {
+            $form = $formManager->get(\IiifServer\Form\ConfigForm::class);
+            $form->init();
+            $form->setData($data);
+        }
         $form->prepare();
 
         $view = $renderer;
 
-        // Dispatch elements to tabs using element_groups.
-        // Fieldsets are rendered as sub-sections within their group.
-        $elementGroups = $form->getOption('element_groups') ?: [];
-        $tabs = array_fill_keys(array_keys($elementGroups), '');
-        $ungrouped = '';
+        // Diagnostics are shown in a dedicated first tab; the remaining tabs
+        // are derived declaratively from the form option "element_tabs" by the
+        // formTabs helper of module Common.
+        $tabsHelper = $view->getHelperPluginManager()->get('formTabs');
+        $tabs = $tabsHelper->tabsFromOption($form);
+        $tabs['audit']['content_before'] = $auditHtml;
 
-        foreach ($form as $element) {
-            if ($element instanceof \Laminas\Form\FieldsetInterface) {
-                $group = $element->getOption('element_group');
-                if ($group && isset($tabs[$group])) {
-                    $tabs[$group] .= $view->formCollection($element);
-                }
-                continue;
-            }
-            $group = $element->getOption('element_group');
-            if ($group && isset($tabs[$group])) {
-                $tabs[$group] .= $view->formRow($element);
-            } else {
-                $ungrouped .= $view->formRow($element);
-            }
-        }
-
-        // Prepend intro text to first tab.
+        // Intro note prepended to the first form tab, after the audit tab.
         $configNote = '<p>'
             . $translate('The module creates manifests with the properties from each resource (item set, item and media).') // @translate
             . ' ' . $translate('The properties below are used when some metadata are missing.') // @translate
             . ' ' . $translate('In all cases, empty properties are not set.') // @translate
             . '</p>';
-        $firstGroup = array_key_first($elementGroups);
-        if ($firstGroup) {
-            $tabs[$firstGroup] = $configNote . $ungrouped
-                . $tabs[$firstGroup];
+        $ids = array_keys($tabs);
+        $firstFormTab = $ids[1] ?? null;
+        if ($firstFormTab !== null) {
+            $tabs[$firstFormTab]['content_before'] = $configNote
+                . ($tabs[$firstFormTab]['content_before'] ?? '');
         }
 
-        // Build tab navigation and content.
-        $iiifModules = [
-            'IiifServer',
-            'ImageServer',
-            'IiifSearch',
-        ];
-        $moduleNav = $view->moduleConfigNav($iiifModules, 'IiifServer');
+        $moduleNav = $view->moduleConfigNav(['IiifServer', 'IiifSearch', 'ImageServer'], 'IiifServer');
 
-        $tabNav = '<li class="active"><a href="#iiifserver-audit">'
-            . $escape($translate('Audit')) . '</a></li>';
-        $tabContent = '<div id="iiifserver-audit" class="section active">'
-            . $auditHtml . '</div>';
-
-        foreach ($elementGroups as $groupName => $groupLabel) {
-            if (empty($tabs[$groupName])) {
-                continue;
-            }
-            $tabNav .= '<li><a href="#iiifserver-' . $groupName . '">'
-                . $escape($translate($groupLabel)) . '</a></li>';
-            $tabContent .= '<div id="iiifserver-' . $groupName
-                . '" class="section">'
-                . $tabs[$groupName] . '</div>';
-        }
-
-        return $moduleNav
-            . '<ul class="section-nav" style="list-style:none;padding:0;">'
-            . $tabNav
-            . '</ul>'
-            . $tabContent;
+        return $moduleNav . $view->formTabs($form, $tabs);
     }
 
     public function handleConfigForm(AbstractController $controller)
@@ -530,8 +499,15 @@ class Module extends AbstractModule
             $settings->set($key, $value);
         }
 
-        $this->normalizeMediaApiSettings($params);
+        // When the module ImageServer is installed, the media api fields are
+        // not part of this form (its own config form owns them). Skipping
+        // avoids normalizing from absent params, which would reset the image
+        // api settings and break every manifest.
+        if (!class_exists('ImageServer\Module', false)) {
+            $this->normalizeMediaApiSettings($params);
+        }
 
+        $this->redirectToConfigFormOnApply($controller);
         return true;
     }
 
@@ -557,9 +533,10 @@ class Module extends AbstractModule
         } else {
             $query = [];
             parse_str($rawPost['fieldset_dimensions']['query'] ?? '', $query);
+            $scope = $rawPost['fieldset_dimensions']['scope'] ?? ['items', 'digital_objects'];
             $job = $dispatcher->dispatch(
                 \IiifServer\Job\MediaDimensions::class,
-                ['query' => $query ?: []]
+                ['query' => $query ?: [], 'scope' => $scope]
             );
             $message = 'Storing dimensions of images, audio and video ({link}job #{job_id}{link_end}, {link_log}logs{link_end})'; // @translate
         }
@@ -568,14 +545,13 @@ class Module extends AbstractModule
         $message = new PsrMessage(
             $message,
             [
-                'link' => sprintf('<a href="%s">',
-                    htmlspecialchars($urlPlugin->fromRoute('admin/id', ['controller' => 'job', 'id' => $job->getId()]))
+                'link' => sprintf('<a href="%s">', htmlspecialchars($urlPlugin->fromRoute('admin/id', ['controller' => 'job', 'id' => $job->getId()]))
                 ),
                 'job_id' => $job->getId(),
                 'link_end' => '</a>',
                 'link_log' => class_exists('Log\Module', false)
-                    ? sprintf('<a href="%1$s">', $urlPlugin->fromRoute('admin/default', ['controller' => 'log'], ['query' => ['job_id' => $job->getId()]]))
-                    : sprintf('<a href="%1$s" target="_blank">', $urlPlugin->fromRoute('admin/id', ['controller' => 'job', 'action' => 'log', 'id' => $job->getId()])),
+                    ? sprintf('<a href="%1$s">', htmlspecialchars($urlPlugin->fromRoute('admin/default', ['controller' => 'log'], ['query' => ['job_id' => $job->getId()]])))
+                    : sprintf('<a href="%1$s" target="_blank" rel="noopener noreferrer">', htmlspecialchars($urlPlugin->fromRoute('admin/id', ['controller' => 'job', 'action' => 'log', 'id' => $job->getId()]))),
             ]
         );
         $message->setEscapeHtml(false);
@@ -681,6 +657,32 @@ class Module extends AbstractModule
         $valueOptions['iiifserver_store_dimensions'] = 'Iiif Server: Store dimensions of medias'; // @translate
         $valueOptions['iiifserver_upgrade_structure'] = 'Iiif Server: Upgrade old tables of contents to new format with four columns (to do only one time for old external manifests)'; // @translate
         $process->setValueOptions($valueOptions);
+
+        if (method_exists($form, 'addTaskSubjects')) {
+            $form->addTaskSubjects([
+                'iiifserver_cache_manifests' => [
+                    'name' => 'IIIF Server manifests cache', // @translate
+                    'description' => 'Pre-build and cache the IIIF presentation manifests.', // @translate
+                    'actions' => [
+                        'iiifserver_cache_manifests' => 'Cache', // @translate
+                    ],
+                ],
+                'iiifserver_store_dimensions' => [
+                    'name' => 'IIIF Server media dimensions', // @translate
+                    'description' => 'Store the dimensions (width and height) of media files.', // @translate
+                    'actions' => [
+                        'iiifserver_store_dimensions' => 'Store', // @translate
+                    ],
+                ],
+                'iiifserver_upgrade_structure' => [
+                    'name' => 'IIIF Server tables of contents', // @translate
+                    'description' => 'Upgrade old tables of contents to the new four-column format (run once for old external manifests).', // @translate
+                    'actions' => [
+                        'iiifserver_upgrade_structure' => 'Upgrade', // @translate
+                    ],
+                ],
+            ]);
+        }
         $fieldset
             ->add([
                 'type' => \Laminas\Form\Fieldset::class,
@@ -778,17 +780,18 @@ class Module extends AbstractModule
         $services = $this->getServiceLocator();
         $settings = $services->get('Omeka\Settings');
 
-        // Check and normalize image api versions.
-        $defaultVersion = $params['iiifserver_media_api_default_version'] ?: '0';
+        // Check and normalize image api versions. Each version has a single max
+        // compliance level, or an empty value when the version is not
+        // supported.
+        $defaultVersion = (string) ($params['iiifserver_media_api_default_version'] ?? '0');
         $has = ['1' => null, '2' => null, '3' => null];
-        foreach ($params['iiifserver_media_api_supported_versions'] ?? [] as $supportedVersion) {
-            $service = strtok($supportedVersion, '/');
-            $level = strtok('/') ?: '0';
-            $has[$service] = isset($has[$service]) && $has[$service] > $level
-                ? $has[$service]
-                : $level;
+        foreach (array_keys($has) as $version) {
+            $level = (string) ($params['iiifserver_media_api_supported_version_' . $version] ?? '');
+            if ($level !== '') {
+                $has[$version] = $level;
+            }
         }
-        $has = array_filter($has);
+        $has = array_filter($has, fn ($level) => $level !== null);
         if ($defaultVersion && !isset($has[$defaultVersion])) {
             $has[$defaultVersion] = '0';
         }
@@ -798,7 +801,6 @@ class Module extends AbstractModule
             $supportedVersions[] = $service . '/' . $level;
         }
         $settings->set('iiifserver_media_api_default_version', $defaultVersion);
-        $settings->set('iiifserver_media_api_supported_versions', $supportedVersions);
 
         // Avoid to do the computation each time for manifest v2, that supports
         // only one service.
@@ -815,6 +817,37 @@ class Module extends AbstractModule
             }
         }
         $settings->set('iiifserver_media_api_default_supported_version', $defaultSupportedVersion);
+    }
+
+    /**
+     * Ensure IIIF cache directories exist. Create them with warnings if fails,
+     * allowing installation even without writeable /files/iiif.
+     */
+    protected function ensureIiifDirectories(): void
+    {
+        $services = $this->getServiceLocator();
+        $config = $services->get('Config');
+        $basePath = $config['file_store']['local']['base_path']
+            ?: (OMEKA_PATH . '/files');
+
+        $logger = $services->get('Omeka\Logger');
+
+        foreach ([2, 3] as $version) {
+            $dirPath = "$basePath/iiif/$version";
+            if (!is_dir($dirPath)) {
+                if (!@mkdir($dirPath, 0775, true)) {
+                    $logger->warn(
+                        'Could not create IIIF cache directory "{path}". Cache will not work unless created manually with proper permissions.',
+                        ['path' => $dirPath]
+                    );
+                }
+            } elseif (!is_writable($dirPath)) {
+                $logger->warn(
+                    'IIIF cache directory "{path}" exists but is not writable. Cache will not work unless permissions are fixed.',
+                    ['path' => $dirPath]
+                );
+            }
+        }
     }
 
     protected function updateWhitelist(): void
@@ -910,22 +943,31 @@ class Module extends AbstractModule
 
         $cacheEnabled = (bool) $settings->get('iiifserver_manifest_cache', false);
 
-        // Count items with many images.
+        // Existence-only probe via EXISTS: the GROUP BY + HAVING short-circuits
+        // at the first item with more than 10 images. The cached flag avoids
+        // re-running it at every form open. The exact count is informational
+        // only; it is not surfaced to keep the audit responsive on large
+        // installations.
         $threshold = 10;
-        $largeItems = (int) $connection->fetchOne(<<<SQL
-            SELECT COUNT(*) FROM (
-                SELECT item_id, COUNT(*) as cnt FROM media
-                WHERE media_type LIKE 'image/%'
-                GROUP BY item_id
-                HAVING cnt > $threshold
-            ) t
-            SQL
-        );
+        $cacheKey = 'iiifserver_audit_large_items';
+        $cached = $settings->get($cacheKey);
+        if (is_array($cached) && isset($cached['at'])
+            && (time() - (int) $cached['at']) < 1800
+        ) {
+            $hasLargeItems = (bool) ($cached['has'] ?? false);
+        } else {
+            $hasLargeItems = (bool) $connection->fetchOne(
+                'SELECT 1 FROM media WHERE media_type LIKE \'image/%\''
+                . ' GROUP BY item_id HAVING COUNT(*) > ? LIMIT 1',
+                [$threshold]
+            );
+            $settings->set($cacheKey, ['at' => time(), 'has' => $hasLargeItems]);
+        }
 
-        if ($largeItems && !$cacheEnabled) {
+        if ($hasLargeItems && !$cacheEnabled) {
             $messenger->addWarning(new PsrMessage(
-                '{count} items have more than {threshold} images. Enabling manifest cache is recommended to avoid slow page loads.', // @translate
-                ['count' => $largeItems, 'threshold' => $threshold]
+                'Some items carry more than {threshold} images. Enabling manifest cache is recommended to avoid slow page loads.', // @translate
+                ['threshold' => $threshold]
             ));
         } elseif ($cacheEnabled) {
             $config = $services->get('Config');
@@ -941,46 +983,61 @@ class Module extends AbstractModule
                     ['dir' => 'files/iiif']
                 ));
             } else {
-                $messenger->addSuccess(new PsrMessage(
-                    'Manifest cache is enabled.' // @translate
-                ));
+                // Test actual write and read capability.
+                $testFile = $cachePath . '/.test_cache_' . time();
+                $testData = '{"test":true}';
+                $writeOk = file_put_contents($testFile, $testData) !== false;
+                $readOk = $writeOk && file_get_contents($testFile) === $testData;
+                @unlink($testFile);
+
+                if ($writeOk && $readOk) {
+                    $messenger->addSuccess(new PsrMessage(
+                        'Manifest cache is enabled and working.' // @translate
+                    ));
+                } else {
+                    $messenger->addError(new PsrMessage(
+                        'Manifest cache is enabled but write/read test failed. Check directory permissions and filesystem available space.' // @translate
+                    ));
+                }
             }
         }
     }
 
     /**
      * Check how many audio/video/image media lack dimensions.
+     *
+     * Strategy on large installations (genovefa: 1M+ media):
+     *  - Re-use a 30-minute cached result when the audit was run recently.
+     *  - Probe via EXISTS (LIMIT 1) instead of COUNT to bail out at the
+     *    first match; only count exactly when no unsized row is found, to
+     *    surface "all dimensioned" success message with a meaningful total.
      */
     protected function checkMediaDimensions(): void
     {
         $services = $this->getServiceLocator();
         $connection = $services->get('Omeka\Connection');
+        $settings = $services->get('Omeka\Settings');
         $messenger = $services->get('ControllerPluginManager')
             ->get('messenger');
 
-        $total = (int) $connection->fetchOne(<<<'SQL'
-            SELECT COUNT(*) FROM media
-            WHERE (media_type LIKE 'image/%'
-                OR media_type LIKE 'audio/%'
-                OR media_type LIKE 'video/%')
-                AND media_type != 'image/svg+xml'
-            SQL
-        );
-        if (!$total) {
+        $cached = $settings->get('iiifserver_audit_media_dimensions');
+        if (is_array($cached)
+            && isset($cached['at'])
+            && (time() - (int) $cached['at']) < 1800
+        ) {
+            $this->renderMediaDimensionsAudit($messenger, $cached);
             return;
         }
 
         // Plain LIKE scan on the JSON text column. It is faster than
-        // JSON_EXTRACT on large tables because it skips JSON parsing
-        // entirely, while relying on the deterministic key order
-        // produced by json_encode. Patterns cover: missing data,
-        // missing "dimensions", missing "original", legacy image
-        // null tuple ({"width":null,"height":null}) and fully-null
-        // audio/video tuple — without matching audio/video rows
+        // JSON_EXTRACT on large tables because it skips JSON parsing entirely,
+        // while relying on the deterministic key order produced by json_encode.
+        // Patterns cover: missing data, missing "dimensions", missing
+        // "original", legacy image null tuple ({"width":null,"height":null})
+        // and fully-null audio/video tuple — without matching audio/video rows
         // that have a valid duration.
-        $unsized = (int) $connection->fetchOne(<<<'SQL'
-            SELECT COUNT(*) FROM media
-            WHERE (media_type LIKE 'image/%'
+        $unsizedFilter = <<<'SQL'
+            (media_type LIKE 'image/%'
                 OR media_type LIKE 'audio/%'
                 OR media_type LIKE 'video/%')
                 AND media_type != 'image/svg+xml'
@@ -989,20 +1046,55 @@ class Module extends AbstractModule
                     OR data NOT LIKE '%"original":%'
                     OR data LIKE '%"original":{"width":null,"height":null}%'
                     OR data LIKE '%"original":{"width":null,"height":null,"duration":null%')
-            SQL
+            SQL;
+
+        $hasUnsized = (bool) $connection->fetchOne(
+            'SELECT 1 FROM media WHERE ' . $unsizedFilter . ' LIMIT 1'
         );
 
+        if (!$hasUnsized) {
+            $total = (int) $connection->fetchOne(<<<'SQL'
+                SELECT COUNT(*) FROM media
+                WHERE (media_type LIKE 'image/%'
+                    OR media_type LIKE 'audio/%'
+                    OR media_type LIKE 'video/%')
+                    AND media_type != 'image/svg+xml'
+                SQL
+            );
+            $audit = ['at' => time(), 'unsized' => 0, 'total' => $total];
+        } else {
+            // Defer the exact count until the admin asks for it: scanning the
+            // JSON column over a million rows can take tens of seconds. The
+            // actionable information is "some are unsized" — the bulk job logs
+            // the exact progress.
+            $audit = ['at' => time(), 'unsized' => -1, 'total' => null];
+        }
+
+        $settings->set('iiifserver_audit_media_dimensions', $audit);
+        $this->renderMediaDimensionsAudit($messenger, $audit);
+    }
+
+    /**
+     * Format the audit result as a single messenger entry.
+     */
+    protected function renderMediaDimensionsAudit($messenger, array $audit): void
+    {
+        $unsized = (int) ($audit['unsized'] ?? -1);
+        $total = $audit['total'] ?? null;
+
+        if ($unsized === 0 && $total === 0) {
+            return;
+        }
         if ($unsized === 0) {
             $messenger->addSuccess(new PsrMessage(
                 'All {total} media (images, audio, video) have stored dimensions.', // @translate
                 ['total' => $total]
             ));
-        } else {
-            $messenger->addWarning(new PsrMessage(
-                '{unsized} of {total} media (images, audio, video) have no stored dimensions. Run "Media Dimensions" job to speed up manifest generation.', // @translate
-                ['unsized' => $unsized, 'total' => $total]
-            ));
+            return;
         }
+        $messenger->addWarning(new PsrMessage(
+            'Some media (images, audio, video) have no stored dimensions. Run "Media Dimensions" job to speed up manifest generation. The exact count is not computed during the audit to keep the page responsive on large installations.' // @translate
+        ));
     }
 
     /**
@@ -1012,8 +1104,22 @@ class Module extends AbstractModule
     {
         $services = $this->getServiceLocator();
         $connection = $services->get('Omeka\Connection');
+        $settings = $services->get('Omeka\Settings');
         $messenger = $services->get('ControllerPluginManager')
             ->get('messenger');
+
+        // The probe triggers a full manifest build on the receiving end; on
+        // large items that costs seconds even when reachable, and a hung
+        // reverse proxy adds the full 5s timeout per form open. Cache the
+        // result for 1h, with a separate hot-path for the success message.
+        $cacheKey = 'iiifserver_audit_manifest_route';
+        $cached = $settings->get($cacheKey);
+        if (is_array($cached) && isset($cached['at'])
+            && (time() - (int) $cached['at']) < 3600
+        ) {
+            $this->renderManifestRouteAudit($messenger, $cached);
+            return;
+        }
 
         // Find any public item to test.
         $itemId = $connection->fetchOne(<<<'SQL'
@@ -1041,23 +1147,38 @@ class Module extends AbstractModule
         ]);
         $result = @file_get_contents($manifestUrl, false, $context);
         if ($result === false) {
-            $messenger->addWarning(new PsrMessage(
-                'Could not reach manifest URL: {url}. Check server configuration.', // @translate
-                ['url' => $manifestUrl]
-            ));
+            $audit = ['at' => time(), 'status' => 'unreachable', 'url' => $manifestUrl, 'id' => $itemId];
         } else {
             $json = json_decode($result, true);
-            if (empty($json)) {
-                $messenger->addWarning(new PsrMessage(
-                    'Manifest URL {url} returned invalid JSON.', // @translate
-                    ['url' => $manifestUrl]
-                ));
-            } else {
-                $messenger->addSuccess(new PsrMessage(
-                    'Manifest route is working (tested item #{id}).', // @translate
-                    ['id' => $itemId]
-                ));
-            }
+            $audit = empty($json)
+                ? ['at' => time(), 'status' => 'invalid', 'url' => $manifestUrl, 'id' => $itemId]
+                : ['at' => time(), 'status' => 'ok', 'url' => $manifestUrl, 'id' => $itemId];
+        }
+        $settings->set($cacheKey, $audit);
+        $this->renderManifestRouteAudit($messenger, $audit);
+    }
+
+    /**
+     * Format the manifest-route audit result as a single messenger entry.
+     */
+    protected function renderManifestRouteAudit($messenger, array $audit): void
+    {
+        $status = (string) ($audit['status'] ?? '');
+        if ($status === 'ok') {
+            $messenger->addSuccess(new PsrMessage(
+                'Manifest route is working (tested item #{id}).', // @translate
+                ['id' => $audit['id'] ?? null]
+            ));
+        } elseif ($status === 'unreachable') {
+            $messenger->addWarning(new PsrMessage(
+                'Could not reach manifest URL: {url}. Check server configuration.', // @translate
+                ['url' => $audit['url'] ?? null]
+            ));
+        } elseif ($status === 'invalid') {
+            $messenger->addWarning(new PsrMessage(
+                'Manifest URL {url} returned invalid JSON.', // @translate
+                ['url' => $audit['url'] ?? null]
+            ));
         }
     }
 
@@ -1265,6 +1386,35 @@ class Module extends AbstractModule
      * "cantaloupe", "iipimage", "unknown", or null).
      */
     protected function checkExternalImageServer(): array
+    {
+        $services = $this->getServiceLocator();
+        $settings = $services->get('Omeka\Settings');
+        $cached = $settings->get('iiifserver_audit_external_image_server');
+        if (is_array($cached)
+            && isset($cached['at'])
+            && (time() - (int) $cached['at']) < 3600
+            && isset($cached['external'])
+        ) {
+            return [
+                'external' => (bool) $cached['external'],
+                'server' => $cached['server'] ?? null,
+            ];
+        }
+
+        $detected = $this->detectExternalImageServer();
+        $settings->set('iiifserver_audit_external_image_server', [
+            'at' => time(),
+            'external' => (bool) $detected['external'],
+            'server' => $detected['server'] ?? null,
+        ]);
+        return $detected;
+    }
+
+    /**
+     * Real probe (self-request + content analysis). Extracted so
+     * {@see checkExternalImageServer()} can cache its result for 1h.
+     */
+    protected function detectExternalImageServer(): array
     {
         $result = ['external' => false, 'server' => null];
 

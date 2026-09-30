@@ -9,6 +9,7 @@
  * @var string $sidebarPosition
  * @var bool $inline
  * @var string $height
+ * @var bool $showZoom
  */
 
 $plugins = $this->getHelperPluginManager();
@@ -56,16 +57,39 @@ switch ($player) {
         break;
 
     case 'openseadragon':
+        // Walk medias attached to the item plus digital objects referenced by
+        // the item via property values (autonomous, no item FK).
+        $appendDos = function ($item, array &$bag): void {
+            $seen = [];
+            foreach ($item->values() as $property) {
+                foreach ($property['values'] as $value) {
+                    $vr = $value->valueResource();
+                    if (!$vr || $vr->resourceName() !== 'digital_objects') {
+                        continue;
+                    }
+                    $id = $vr->id();
+                    if (isset($seen[$id])) {
+                        continue;
+                    }
+                    $seen[$id] = true;
+                    $bag[] = $vr;
+                }
+            }
+        };
         $medias = [];
-        if ($resourceName === 'media') {
+        if ($resourceName === 'media' || $resourceName === 'digital_objects') {
             $medias = [$resource];
         } elseif ($resourceName === 'items') {
-            $medias = $resource->media();
+            foreach ($resource->media() as $m) {
+                $medias[] = $m;
+            }
+            $appendDos($resource, $medias);
         } elseif ($resourceName === 'item_sets') {
             foreach ($resource->items() as $it) {
                 foreach ($it->media() as $m) {
                     $medias[] = $m;
                 }
+                $appendDos($it, $medias);
             }
         }
         $isIiifMedia = $plugins->get('isIiifMedia');
@@ -124,6 +148,9 @@ switch ($player) {
         ];
         $stageAttrs['data-osd-options'] = json_encode($osdOptions, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         $stageAttrs['data-osd-strings'] = json_encode($osdStrings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (!empty($showZoom)) {
+            $stageAttrs['data-show-zoom'] = '1';
+        }
         break;
 
     default:
@@ -169,7 +196,7 @@ $triggerClass = $trigger === null ? 'button iiif-player-toggle' : 'iiif-player-t
     <?php endif; ?>
     <div class="iiif-player-overlay" role="dialog" aria-modal="true">
         <div class="iiif-player-stage"<?= $stageAttrsStr ?>><?= (!$lazy ? ($directHtml ?? '') : '') ?></div>
-        <button type="button" class="iiif-player-close" aria-label="<?= $escapeAttr($translate('Close')) ?>">×</button>
+        <button type="button" class="iiif-player-close" aria-label="<?= $escapeAttr($translate('Close')) ?>"><span class="iiif-player-close-label"><?= $escape($translate('Close')) ?></span><span class="iiif-player-close-icon" aria-hidden="true">×</span></button>
     </div>
 </div>
 

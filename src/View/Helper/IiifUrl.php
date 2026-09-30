@@ -61,6 +61,11 @@ class IiifUrl extends AbstractHelper
     protected $defaultVersion;
 
     /**
+     * @var bool
+     */
+    protected $versionAppend;
+
+    /**
      * @var string
      */
     protected $prefix;
@@ -97,6 +102,7 @@ class IiifUrl extends AbstractHelper
         IiifMediaUrl $iifImageUrl,
         $baseUrlPath,
         $defaultVersion,
+        bool $versionAppend,
         $forceUrlFrom,
         $forceUrlTo,
         $prefix,
@@ -107,6 +113,7 @@ class IiifUrl extends AbstractHelper
         $this->iiifMediaUrl = $iifImageUrl;
         $this->baseUrlPath = $baseUrlPath;
         $this->defaultVersion = $defaultVersion;
+        $this->versionAppend = $versionAppend;
         $this->forceUrlFrom = $forceUrlFrom;
         $this->forceUrlTo = $forceUrlTo;
         $this->prefix = $prefix;
@@ -127,7 +134,10 @@ class IiifUrl extends AbstractHelper
      */
     public function __invoke($resource, $route = '', $version = null, array $params = []): string
     {
-        $apiVersion = $version ?: $this->defaultVersion;
+        // Only include the version segment in the URL when the caller passes
+        // it explicitly or the setting iiifserver_url_version_add is enabled.
+        // Otherwise the route default ('') is kept and the segment is omitted.
+        $apiVersion = $version ?: ($this->versionAppend ? $this->defaultVersion : '');
 
         $urlOptions = ['force_canonical' => true];
         if (isset($params['query'])) {
@@ -165,7 +175,10 @@ class IiifUrl extends AbstractHelper
             $resourceName = $resource->resourceName();
         }
 
-        if ($resourceName === 'media') {
+        // Digital objects are treated as media everywhere: same image API
+        // endpoint (info.json), not manifest. DO replaces media in the data
+        // model so the URL helpers must mirror media behavior.
+        if ($resourceName === 'media' || $resourceName === 'digital_objects') {
             return $this->iiifMediaUrl->__invoke($resource, null, $version, $params);
         }
 
@@ -180,8 +193,12 @@ class IiifUrl extends AbstractHelper
             'id' => $this->iiifCleanIdentifiers->__invoke($id),
         ];
 
+        $routeName = $route ?: ($mapRouteNames[$resourceName] ?? null);
+        if (!$routeName) {
+            return '';
+        }
         $urlIiif = $this->url->__invoke(
-            $route ?: $mapRouteNames[$resourceName],
+            $routeName,
             $params,
             $urlOptions
         );

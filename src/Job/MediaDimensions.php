@@ -2,6 +2,7 @@
 
 namespace IiifServer\Job;
 
+use Omeka\Api\Representation\AbstractResourceEntityRepresentation;
 use Omeka\Api\Representation\MediaRepresentation;
 use Omeka\Job\AbstractJob;
 
@@ -91,6 +92,26 @@ class MediaDimensions extends AbstractJob
             $query = $sQuery ?: [];
         }
 
+        $scope = (array) $this->getArg('scope', ['items', 'digital_objects']);
+        $scope = array_values(array_intersect($scope, ['items', 'digital_objects']));
+        if (!$scope) {
+            $this->logger->warn(
+                'No scope selected (items / digital objects). Nothing to do.' // @translate
+            );
+            return;
+        }
+        $doItems = in_array('items', $scope, true);
+        $doDigitalObjects = in_array('digital_objects', $scope, true);
+
+        $this->prepareSizer();
+
+        $this->totalToProcess = 0;
+        $this->totalMedias = 0;
+        $this->totalProcessed = 0;
+        $this->totalSucceed = 0;
+        $this->totalFailed = 0;
+        $this->totalSkipped = 0;
+
         $response = $api->search('items', $query);
         $this->totalToProcess = $response->getTotalResults();
         if (empty($this->totalToProcess)) {
@@ -100,19 +121,16 @@ class MediaDimensions extends AbstractJob
             return;
         }
 
-        $this->prepareSizer();
-
         $this->logger->info(
-            'Starting bulk sizing for {total} items ({mode} media).', // @translate
-            ['total' => $this->totalToProcess, 'mode' => $this->filter]
+            'Starting bulk sizing for {total} items ({mode} media, scope: {scope}).', // @translate
+            ['total' => $this->totalToProcess, 'mode' => $this->filter, 'scope' => implode(', ', $scope)]
         );
 
+        // Collect ids of digital objects referenced by items, to deduplicate
+        // across items (a DO can be shared by many items).
+        $doIds = [];
+
         $offset = 0;
-        $this->totalMedias = 0;
-        $this->totalProcessed = 0;
-        $this->totalSucceed = 0;
-        $this->totalFailed = 0;
-        $this->totalSkipped = 0;
         while (true) {
             /** @var \Omeka\Api\Representation\ItemRepresentation[] $items */
             $items = $api
@@ -131,20 +149,36 @@ class MediaDimensions extends AbstractJob
                     break 2;
                 }
 
-                /** @var \Omeka\Api\Representation\MediaRepresentation $media */
-                foreach ($item->media() as $media) {
-                    $mainMediaType = strtok((string) $media->mediaType(), '/');
-                    if (in_array($mainMediaType, ['image', 'audio', 'video'])
-                        // For ingester bulk_upload, wait that the process is
-                        // finished, else the thumbnails won't be available and
-                        // the size of derivative will be the fallback ones.
-                        && $media->ingester() !== 'bulk_upload'
-                    ) {
+                if ($doItems) {
+                    /** @var \Omeka\Api\Representation\MediaRepresentation $media */
+                    foreach ($item->media() as $media) {
+                        if (!$this->isImageAudioVideoMedia($media)
+                            // For ingester bulk_upload, wait that the process
+                            // is finished, else the thumbnails won't be
+                            // available and the size of derivative will be the
+                            // fallback.
+                            || $media->ingester() === 'bulk_upload'
+                        ) {
+                            unset($media);
+                            continue;
+                        }
                         ++$this->totalMedias;
                         $this->prepareSize($media);
+                        unset($media);
                     }
-                    unset($media);
                 }
+
+                if ($doDigitalObjects) {
+                    foreach ($item->values() as $property) {
+                        foreach ($property['values'] as $value) {
+                            $vr = $value->valueResource();
+                            if ($vr && $vr->resourceName() === 'digital_objects') {
+                                $doIds[$vr->id()] = true;
+                            }
+                        }
+                    }
+                }
+
                 unset($item);
 
                 ++$this->totalProcessed;
@@ -152,6 +186,45 @@ class MediaDimensions extends AbstractJob
 
             $this->entityManager->clear();
             $offset += self::SQL_LIMIT;
+            $this->logger->info(
+                'Progress: {count}/{total} items processed, {medias} medias seen, {sized} sized, {skipped} skipped, {failed} failed.', // @translate
+                [
+                    'count' => $this->totalProcessed,
+                    'total' => $this->totalToProcess,
+                    'medias' => $this->totalMedias,
+                    'sized' => $this->totalSucceed,
+                    'skipped' => $this->totalSkipped,
+                    'failed' => $this->totalFailed,
+                ]
+            );
+        }
+
+        // Second pass: digital objects referenced by the matched items.
+        if ($doDigitalObjects && $doIds) {
+            $doIds = array_keys($doIds);
+            foreach (array_chunk($doIds, self::SQL_LIMIT) as $chunk) {
+                if ($this->shouldStop()) {
+                    break;
+                }
+                try {
+                    $dos = $api->search('digital_objects', ['id' => $chunk])->getContent();
+                } catch (\Omeka\Api\Exception\BadRequestException $e) {
+                    break;
+                }
+                foreach ($dos as $do) {
+                    if ($this->shouldStop()) {
+                        break 2;
+                    }
+                    if (!$this->isImageAudioVideoMedia($do)) {
+                        unset($do);
+                        continue;
+                    }
+                    ++$this->totalMedias;
+                    $this->prepareSize($do);
+                    unset($do);
+                }
+                $this->entityManager->clear();
+            }
         }
 
         $this->logger->notice(
@@ -174,7 +247,8 @@ class MediaDimensions extends AbstractJob
         $this->mediaDimension = $services->get('ControllerPluginManager')->get('mediaDimension');
         // The api cannot update value "data", so use entity manager.
         $this->entityManager = $services->get('Omeka\EntityManager');
-        $this->mediaRepository = $this->entityManager->getRepository(\Omeka\Entity\Media::class);
+        // Use Resource repository to support both Media and DigitalObject.
+        $this->mediaRepository = $this->entityManager->getRepository(\Omeka\Entity\Resource::class);
 
         $this->filter = $this->getArg('filter', 'all');
         if (!in_array($this->filter, ['all', 'sized', 'unsized'])) {
@@ -189,46 +263,47 @@ class MediaDimensions extends AbstractJob
      * @see \IiifServer\Module::prepareSizeItem()
      * @see \IiifServer\Job\MediaDimensions::prepareSize()
      */
-    protected function prepareSize(MediaRepresentation $media): void
+    protected function prepareSize(AbstractResourceEntityRepresentation $media): void
     {
-        $mainMediaType = strtok((string) $media->mediaType(), '/');
-        if (!in_array($mainMediaType, ['image', 'audio', 'video'])) {
+        if (!$this->isImageAudioVideoMedia($media)) {
             return;
         }
+        $mainMediaType = $this->mainMediaType($media);
 
         // Keep possible data added by another module.
         $mediaData = $media->mediaData() ?: [];
 
-        switch ($mainMediaType) {
-            case 'audio':
-            case 'video':
-                if ($this->filter === 'sized') {
-                    if (empty($mediaData['dimensions']['original']['duration'])) {
-                        ++$this->totalSkipped;
-                        return;
-                    }
-                } elseif ($this->filter === 'unsized') {
-                    if (!empty($mediaData['dimensions']['original']['duration'])) {
-                        ++$this->totalSkipped;
-                        return;
-                    }
-                }
-                break;
-            case 'image':
-            default:
-                // Some images have no original.
-                if ($this->filter === 'sized') {
-                    if (empty($mediaData['dimensions']['large']['width'])) {
-                        ++$this->totalSkipped;
-                        return;
-                    }
-                } elseif ($this->filter === 'unsized') {
-                    if (!empty($mediaData['dimensions']['large']['width'])) {
-                        ++$this->totalSkipped;
-                        return;
-                    }
-                }
-                break;
+        // Expected types: image carries original + all thumbnails; audio/video
+        // only the original (no derivative geometry).
+        $expectedTypes = $mainMediaType === 'image'
+            ? $this->imageTypes
+            : ['original'];
+
+        // Pivot value to test per type: images use width (dimension), audio /
+        // video use duration (time). A type counts as "already attempted" when
+        // its pivot key exists in the stored dimensions — even with a null
+        // value, which means a previous run tried and failed to read the file.
+        // Using empty() would treat null as missing and reprocess the same
+        // broken file on every run.
+        $pivot = $mainMediaType === 'image' ? 'width' : 'duration';
+        $missing = [];
+        foreach ($expectedTypes as $type) {
+            $entry = $mediaData['dimensions'][$type] ?? null;
+            if (!is_array($entry) || !array_key_exists($pivot, $entry)) {
+                $missing[] = $type;
+            }
+        }
+
+        if ($this->filter === 'unsized' && !$missing) {
+            // Everything already sized: nothing to do for this filter.
+            ++$this->totalSkipped;
+            return;
+        }
+        if ($this->filter === 'sized' && count($missing) === count($expectedTypes)) {
+            // Fully unsized: skipped by intent (the 'sized' filter targets
+            // refresh of already-sized medias).
+            ++$this->totalSkipped;
+            return;
         }
 
         /** @var \Omeka\Entity\Media $mediaEntity */
@@ -265,6 +340,78 @@ class MediaDimensions extends AbstractJob
         $this->entityManager->flush();
         unset($mediaEntity);
 
-        ++$this->totalSucceed;
+        // Counted as "succeeded" only when at least one expected type was
+        // actually measured; otherwise the run is a true failure (loggued
+        // above) and must not double-count.
+        if (!$failedTypes
+            || count($failedTypes) < (
+                $mainMediaType === 'image' ? count($this->imageTypes) : 1
+            )
+        ) {
+            ++$this->totalSucceed;
+        }
+    }
+
+    /**
+     * Recognise a resource that carries width/height/duration semantics,
+     * including IIIF-ingested medias whose stored media_type is null. Those
+     * remote IIIF medias are always images by construction (Image API or
+     * Presentation canvas).
+     */
+    protected function isImageAudioVideoMedia(AbstractResourceEntityRepresentation $media): bool
+    {
+        $mainMediaType = $this->mainMediaType($media);
+        return in_array($mainMediaType, ['image', 'audio', 'video'], true);
+    }
+
+    /**
+     * Resolve the main media type, with a fallback for IIIF-ingested medias
+     * whose stored media_type is null.
+     *
+     * The Image API ingester ('iiif') always describes an image. The
+     * Presentation ingester ('iiif_presentation') can describe any media
+     * (canvas content), so the type is read from the payload format/type field;
+     * if absent, the media is reported as unknown.
+     */
+    protected function mainMediaType(AbstractResourceEntityRepresentation $media): string
+    {
+        $main = strtok((string) $media->mediaType(), '/');
+        if ($main !== false && $main !== '') {
+            return $main;
+        }
+        // Use the renderer (not the ingester) so digital objects, whose
+        // ingester is always "digital_object", are recognized too.
+        $renderer = method_exists($media, 'renderer') ? (string) $media->renderer() : '';
+        if ($renderer === 'iiif') {
+            return 'image';
+        }
+        if ($renderer === 'iiif_presentation') {
+            $data = $media->mediaData() ?: [];
+            // IIIF Presentation 3: canvas/painting body has a `format` (mime)
+            // and a `type` ("Image", "Sound", "Video"). v2 uses `format` and
+            // `@type` ("oa:Annotation" with motivation "painting" wraps the
+            // content).
+            $format = $data['format'] ?? null;
+            if (is_string($format) && $format !== '') {
+                $main = strtok($format, '/');
+                if (in_array($main, ['image', 'audio', 'video'], true)) {
+                    return $main;
+                }
+            }
+            $type = $data['type'] ?? $data['@type'] ?? null;
+            if (is_string($type)) {
+                $type = strtolower($type);
+                if ($type === 'image' || $type === 'dctypes:image' || $type === 'sc:image') {
+                    return 'image';
+                }
+                if ($type === 'sound' || $type === 'audio') {
+                    return 'audio';
+                }
+                if ($type === 'video' || $type === 'dctypes:movingimage') {
+                    return 'video';
+                }
+            }
+        }
+        return '';
     }
 }

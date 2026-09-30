@@ -19,6 +19,47 @@
         });
     }
 
+    function attachZoomIndicator(viewer, inner) {
+        var host = inner.parentNode;
+        if (!host || host.querySelector('.iiif-player-zoom')) return;
+        var el = document.createElement('div');
+        el.className = 'iiif-player-zoom';
+        el.setAttribute('aria-live', 'polite');
+        el.textContent = '';
+        host.appendChild(el);
+
+        var hideTimer = null;
+        var lastPct = null;
+        function show() {
+            el.classList.add('is-visible');
+            if (hideTimer) clearTimeout(hideTimer);
+            hideTimer = setTimeout(function () {
+                el.classList.remove('is-visible');
+            }, 3000);
+        }
+        function update(force) {
+            var vp = viewer.viewport;
+            if (!vp) return;
+            // 100 % = 1 image pixel rendered on 1 screen pixel (image displayed
+            // at its native resolution). imageToViewportZoom(1) returns the
+            // viewport zoom that achieves this 1:1 ratio.
+            var nativeZoom = vp.imageToViewportZoom ? vp.imageToViewportZoom(1) : null;
+            if (!nativeZoom) return;
+            var pct = Math.round((vp.getZoom(true) / nativeZoom) * 100);
+            if (pct === lastPct && !force) return;
+            lastPct = pct;
+            el.textContent = pct + ' %';
+            show();
+        }
+        // 'zoom' is not a viewer-level event in OpenSeadragon. The relevant
+        // events are 'open' (initial render) and 'animation' (continuous ticks
+        // during zoom/pan; we filter pan-only updates by comparing rounded
+        // percentages).
+        viewer.addHandler('open', function () { update(true); });
+        viewer.addHandler('animation', function () { update(false); });
+        if (viewer.world && viewer.world.getItemCount() > 0) update(true);
+    }
+
     function initCore(stage) {
         var player = stage.getAttribute('data-player');
         var embedId = stage.getAttribute('data-embed-id');
@@ -46,6 +87,7 @@
 
             if (tiles && tiles.length > 1) {
                 var pos = stage.getAttribute('data-sidebar-position') || 'bottom';
+                var horizontal = (pos === 'top' || pos === 'bottom');
                 stage.classList.add('iiif-player-sidebar-' + pos);
                 stage.removeChild(inner);
                 var osdArea = document.createElement('div');
@@ -53,6 +95,21 @@
                 osdArea.appendChild(inner);
                 var sidebar = document.createElement('div');
                 sidebar.className = 'iiif-player-sidebar';
+                var navPrev = document.createElement('button');
+                navPrev.type = 'button';
+                navPrev.className = 'iiif-player-nav iiif-player-nav-prev';
+                navPrev.setAttribute('aria-label', horizontal ? 'Previous' : 'Up');
+                navPrev.innerHTML = horizontal ? '&#9664;' : '&#9650;';
+                var navNext = document.createElement('button');
+                navNext.type = 'button';
+                navNext.className = 'iiif-player-nav iiif-player-nav-next';
+                navNext.setAttribute('aria-label', horizontal ? 'Next' : 'Down');
+                navNext.innerHTML = horizontal ? '&#9654;' : '&#9660;';
+                var track = document.createElement('div');
+                track.className = 'iiif-player-sidebar-track';
+                sidebar.appendChild(navPrev);
+                sidebar.appendChild(track);
+                sidebar.appendChild(navNext);
                 if (pos === 'top' || pos === 'left') {
                     stage.appendChild(sidebar);
                     stage.appendChild(osdArea);
@@ -61,42 +118,73 @@
                     stage.appendChild(sidebar);
                 }
 
+                var thumbs = [];
+                var currentIndex = 0;
+                function scrollToCenter(thumb) {
+                    if (!thumb) return;
+                    if (horizontal) {
+                        var target = thumb.offsetLeft - (track.clientWidth / 2) + (thumb.offsetWidth / 2);
+                        track.scrollTo({ left: target, behavior: 'smooth' });
+                    } else {
+                        var target2 = thumb.offsetTop - (track.clientHeight / 2) + (thumb.offsetHeight / 2);
+                        track.scrollTo({ top: target2, behavior: 'smooth' });
+                    }
+                }
+                function goTo(i) {
+                    if (i < 0 || i >= tiles.length || i === currentIndex) {
+                        updateNav();
+                        return;
+                    }
+                    currentIndex = i;
+                    if (window._iiifPlayerOsd && window._iiifPlayerOsd[inner.id]) {
+                        window._iiifPlayerOsd[inner.id].open(toTileSource(tiles[i]));
+                    }
+                    thumbs.forEach(function (el, j) {
+                        el.classList.toggle('active', j === i);
+                    });
+                    scrollToCenter(thumbs[i]);
+                    updateNav();
+                }
                 tiles.forEach(function (t, i) {
                     var a = document.createElement('button');
                     a.type = 'button';
                     a.className = 'iiif-player-thumb';
                     a.title = t.title || '';
+                    a.setAttribute('aria-label', t.title || '');
                     a.innerHTML = '<img src="' + t.thumb + '" alt="">';
-                    a.addEventListener('click', function () {
-                        if (window._iiifPlayerOsd && window._iiifPlayerOsd[inner.id]) {
-                            window._iiifPlayerOsd[inner.id].open(toTileSource(t));
-                        }
-                        sidebar.querySelectorAll('.iiif-player-thumb.active').forEach(function (el) {
-                            el.classList.remove('active');
-                        });
-                        a.classList.add('active');
-                    });
+                    a.addEventListener('click', function () { goTo(i); });
                     if (i === 0) a.classList.add('active');
-                    sidebar.appendChild(a);
+                    track.appendChild(a);
+                    thumbs.push(a);
                 });
 
                 // Translate vertical wheel to horizontal scroll on horizontal
                 // sidebars; without this the wheel event bubbles up to the
                 // OpenSeadragon canvas and zooms the viewer instead.
-                if (pos === 'top' || pos === 'bottom') {
-                    sidebar.addEventListener('wheel', function (e) {
+                if (horizontal) {
+                    track.addEventListener('wheel', function (e) {
                         var delta = e.deltaX || e.deltaY;
                         if (!delta) return;
                         e.preventDefault();
-                        sidebar.scrollLeft += delta;
+                        track.scrollLeft += delta;
                     }, { passive: false });
                 }
+
+                function updateNav() {
+                    navPrev.disabled = currentIndex <= 0;
+                    navNext.disabled = currentIndex >= tiles.length - 1;
+                }
+                navPrev.addEventListener('click', function () { goTo(currentIndex - 1); });
+                navNext.addEventListener('click', function () { goTo(currentIndex + 1); });
+                updateNav();
             }
 
             var optsJson = stage.getAttribute('data-osd-options');
             var stringsJson = stage.getAttribute('data-osd-strings');
             var extraOpts = optsJson ? JSON.parse(optsJson) : {};
             var strings = stringsJson ? JSON.parse(stringsJson) : {};
+
+            var showZoom = stage.getAttribute('data-show-zoom') === '1';
 
             var start2 = function () {
                 Object.keys(strings).forEach(function (k) {
@@ -107,14 +195,24 @@
                 opts.prefixUrl = prefix;
                 opts.tileSources = [toTileSource(firstTile)];
                 window._iiifPlayerOsd = window._iiifPlayerOsd || {};
-                window._iiifPlayerOsd[inner.id] = window.OpenSeadragon(opts);
+                var viewer = window.OpenSeadragon(opts);
+                window._iiifPlayerOsd[inner.id] = viewer;
+                if (showZoom) attachZoomIndicator(viewer, inner);
             };
             if (window.OpenSeadragon) start2(); else loadScript(assetJs, start2);
         }
     }
 
     function setup(root) {
-        var stage = root.querySelector('.iiif-player-stage');
+        var btn = root.querySelector('.iiif-player-toggle');
+        // The overlay (with the stage and close button) may have been portalled
+        // out of the button by the theme's advanced player; resolve it via the
+        // toggle's aria-controls so the toggle still binds wherever it lives.
+        var ovId = btn ? btn.getAttribute('aria-controls') : null;
+        var overlay = root.querySelector('.iiif-player-overlay')
+            || (ovId ? document.getElementById(ovId) : null);
+        var stage = root.querySelector('.iiif-player-stage')
+            || (overlay ? overlay.querySelector('.iiif-player-stage') : null);
         if (!stage) return;
 
         var player = stage.getAttribute('data-player');
@@ -126,9 +224,7 @@
             return;
         }
 
-        var btn = root.querySelector('.iiif-player-toggle');
-        var overlay = root.querySelector('.iiif-player-overlay');
-        var closeBtn = root.querySelector('.iiif-player-close');
+        var closeBtn = overlay ? overlay.querySelector('.iiif-player-close') : null;
         var tpl = root.querySelector('template.iiif-player-template');
         if (!btn || !overlay || !closeBtn) return;
 
@@ -150,11 +246,15 @@
             document.body.style.overflow = 'hidden';
             // Module viewers init hidden: force relayout.
             window.dispatchEvent(new Event('resize'));
+            // a11y: move focus into the dialog (do not keep it on the toggle).
+            closeBtn.focus();
         }
         function close() {
             overlay.style.display = 'none';
             btn.setAttribute('aria-expanded', 'false');
             document.body.style.overflow = '';
+            // a11y: return focus to the toggle (e.g. after Escape).
+            btn.focus();
         }
 
         btn.addEventListener('click', open);

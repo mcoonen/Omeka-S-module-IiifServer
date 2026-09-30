@@ -179,11 +179,6 @@ abstract class AbstractResourceType extends AbstractType
     protected $easyMeta;
 
     /**
-     * @var \IiifServer\Mvc\Controller\Plugin\FixUtf8
-     */
-    protected $fixUtf8;
-
-    /**
      * @var bool
      */
     protected $hasModuleAccess;
@@ -219,9 +214,9 @@ abstract class AbstractResourceType extends AbstractType
     protected $iiifMediaUrl;
 
     /**
-     * @var \IiifServer\View\Helper\IiifMediaRelatedOcr
+     * @var \IiifSearch\View\Helper\IiifSearchAnnotationUrl|null
      */
-    protected $iiifMediaRelatedOcr;
+    protected $iiifSearchAnnotationUrl;
 
     /**
      * @var \IiifServer\View\Helper\IiifTileInfo
@@ -380,11 +375,6 @@ abstract class AbstractResourceType extends AbstractType
     protected $urlHelper;
 
     /**
-     * @var string
-     */
-    protected $xmlFixMode;
-
-    /**
      * @var AbstractResourceEntityRepresentation
      */
     protected $resource;
@@ -409,9 +399,10 @@ abstract class AbstractResourceType extends AbstractType
         $this->api = $this->services->get('Omeka\ApiManager');
         $this->defaultSite = $viewHelpers->get('defaultSite')();
         $this->easyMeta = $this->services->get('Common\EasyMeta');
-        $this->fixUtf8 = $plugins->get('fixUtf8');
         $this->iiifCleanIdentifiers = $viewHelpers->get('iiifCleanIdentifiers');
-        $this->iiifMediaRelatedOcr = $viewHelpers->get('iiifMediaRelatedOcr');
+        $this->iiifSearchAnnotationUrl = $viewHelpers->has('iiifSearchAnnotationUrl')
+            ? $viewHelpers->get('iiifSearchAnnotationUrl')
+            : null;
         $this->iiifMediaUrl = $viewHelpers->get('iiifMediaUrl');
         $this->iiifTileInfo = $viewHelpers->get('iiifTileInfo');
         $this->iiifTypeOfMedia = $viewHelpers->get('iiifTypeOfMedia');
@@ -435,8 +426,13 @@ abstract class AbstractResourceType extends AbstractType
         $this->basePath = $config['file_store']['local']['base_path'] ?: (OMEKA_PATH . '/files');
         $this->baseUri = $config['file_store']['local']['base_uri'] ?: (rtrim($this->urlHelper->__invoke('top', [], ['force_canonical' => true]), '/') . '/files');
         $this->iiifImageApiVersion = $this->settings->get('iiifserver_media_api_default_version', '2');
-        $this->iiifImageApiSupportedVersions = (array) $this->settings->get('iiifserver_media_api_supported_versions', ['2/2', '3/2']);
-        $this->xmlFixMode = $this->settings->get('iiifsearch_xml_fix_mode', 'no');
+        $this->iiifImageApiSupportedVersions = [];
+        foreach (['1' => '', '2' => '2', '3' => '2'] as $version => $default) {
+            $level = $this->settings->get('iiifserver_media_api_supported_version_' . $version, $default);
+            if ($level !== '' && $level !== null) {
+                $this->iiifImageApiSupportedVersions[] = $version . '/' . $level;
+            }
+        }
 
         return $this;
     }
